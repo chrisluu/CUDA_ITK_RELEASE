@@ -1,0 +1,161 @@
+
+#ifndef __ibiaAtlasImageCreatorFilter_txx
+#define __ibiaAtlasImageCreatorFilter_txx
+
+#include "ibiaAtlasImageCreatorFilter.h"
+
+namespace ibia
+{
+
+
+/** Standard constructor. **/
+template <class TInputImage, class TOutputImage>
+AtlasImageCreatorFilter<TInputImage, TOutputImage>::
+  AtlasImageCreatorFilter()
+{
+  
+  if(itk::checkCUDA()){
+  	 itk::initCUDA(); // Initialise CUDA device
+  }
+  m_NumberOfPrincipalComponents = 0;
+  m_RootEvTimesSd = NULL;
+  m_AtlasDefaultPixelValue = 0;
+  m_AtlasDist = 0;
+
+  m_PrincipalComponentImageContainer.clear();
+}
+
+/** Destructor. **/
+template <class TInputImage, class TOutputImage>
+AtlasImageCreatorFilter<TInputImage, TOutputImage>::
+  ~AtlasImageCreatorFilter()
+{
+  // ...
+  if(itk::checkCUDA())
+  	cudaFilter.FreeMemory();
+  m_AtlasDist = NULL;
+}
+
+/** Print own information. **/
+template <class TInputImage, class TOutputImage>
+void AtlasImageCreatorFilter<TInputImage, TOutputImage>::
+  PrintSelf(std::ostream& os, itk::Indent indent) const
+{
+  Superclass::PrintSelf(os, indent);
+  //
+}
+
+/** This method is used to set the state of the filter before
+  * multi-threading. */
+template <class TInputImage, class TOutputImage>
+void AtlasImageCreatorFilter<TInputImage, TOutputImage>::
+  BeforeThreadedGenerateData()
+{
+  // initialize output field with zero-field:
+  OutputImagePointer outImage = this->GetOutput();
+
+  outImage->FillBuffer(m_AtlasDefaultPixelValue);
+
+  m_RootEvTimesSd = new float[m_NumberOfPrincipalComponents];
+
+  // pre-calculate this products for faster filtering:
+  for (unsigned int i = 0; i < m_NumberOfPrincipalComponents; i++)
+    m_RootEvTimesSd[i] = std::sqrt(m_Eigenvalues[i]) * m_StandardDeviations[i];
+}
+
+/** This method is used to set the state of the filter after
+  * multi-threading. */
+template <class TInputImage, class TOutputImage>
+void AtlasImageCreatorFilter<TInputImage, TOutputImage>::
+  AfterThreadedGenerateData()
+{
+  delete[] m_RootEvTimesSd;
+}
+
+/** AtlasImageCreatorFilter is implemented as a multi-threaded filter.
+  * As such, it needs to provide and implementation for ThreadedGenerateData().
+  */
+template <class TInputImage, class TOutputImage>
+void AtlasImageCreatorFilter<TInputImage, TOutputImage>::
+  ThreadedGenerateData(const OutputImageRegionType& outputRegionForThread,
+  int threadId)
+{
+  OutputImagePointer outImage = this->GetOutput();
+  InputImagePointer inImage = static_cast<InputImageType *>(
+    this->itk::ProcessObject::GetInput(0)); // mean field
+
+  unsigned int timer;
+  if(itk::checkTime())
+  {
+    // check running time
+    timer = 0;
+    CUT_SAFE_CALL(cutCreateTimer(&(timer)));
+    CUT_SAFE_CALL(cutStartTimer(timer));
+  }
+  /** Compute the Filter on the GPU, if CUDA is enabled.
+    */
+  if(itk::checkCUDA()){
+  	   cudaFilter.SetInputImage(inImage);
+  	   cudaFilter.RunKernel(outImage, m_RootEvTimesSd, m_AtlasDefaultPixelValue);		//Starts computing on GPU
+  }
+  else
+  {
+
+    // intialize iterators:
+    ImageIteratorType outIterator(outImage, outputRegionForThread);
+    ImageIteratorType meanIterator(inImage, outputRegionForThread);
+    AtlasIteratorType distIterator(m_AtlasDist, outputRegionForThread);
+
+    // allocate and initialize the PC-iterators:
+    ImageIteratorType *pcIterators[m_NumberOfPrincipalComponents];
+
+    for (unsigned int i = 0; i < m_NumberOfPrincipalComponents; i++)
+    { pcIterators[i] = new ImageIteratorType(
+	m_PrincipalComponentImageContainer[i], outputRegionForThread);
+      pcIterators[i]->GoToBegin();
+    }
+
+    // apply: mean-image + { SD[i] * EV[i] * PC[i] }_i=1..n
+    OutputPixelType pixel;
+    float dist;
+
+    for (outIterator.GoToBegin(), meanIterator.GoToBegin(),
+	distIterator.GoToBegin(); !outIterator.IsAtEnd();
+	++outIterator, ++meanIterator, ++distIterator)
+    { dist = distIterator.Get(); // get atlas distance map value
+      
+      if (dist >= 0.0) // inside if distance map value >= 0.
+      {
+       
+      pixel = 0.0;
+	  for (unsigned int i = 0; i < m_NumberOfPrincipalComponents; i++)
+	  		pixel += (pcIterators[i]->Get() * m_RootEvTimesSd[i]);
+
+	  pixel += meanIterator.Get();
+      //std::cout<< "Dist: " << dist << ", pixel: " << pixel << std::endl;
+      }
+      else // value is more or less arbitrary
+		 pixel = m_AtlasDefaultPixelValue;
+
+      // increment principal component iterators:
+      for (unsigned int i = 0; i < m_NumberOfPrincipalComponents; i++)
+	++(*pcIterators[i]);
+
+      outIterator.Set(pixel);
+    }
+    // free memory:
+    for (unsigned int i = 0; i < m_NumberOfPrincipalComponents; i++)
+      delete pcIterators[i];
+  }
+  if(itk::checkTime())
+  {
+    CUT_SAFE_CALL(cutStopTimer(timer));
+    printf("Total Time: %f (ms)\n", cutGetTimerValue(timer));
+    CUT_SAFE_CALL(cutDeleteTimer(timer));
+  }
+}
+
+
+}
+
+#endif
